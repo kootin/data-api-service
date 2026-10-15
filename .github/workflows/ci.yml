@@ -1,0 +1,50 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - run: ruff check . && ruff format --check .
+      - run: pytest -q
+
+  integration:
+    # Same API against real Postgres and MongoDB containers.
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: market, POSTGRES_PASSWORD: market, POSTGRES_DB: market }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U market" --health-interval 5s --health-retries 10
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+    env:
+      APP_DATABASE_URL: postgresql+psycopg://market:market@localhost:5432/market
+      APP_MONGO_URL: mongodb://localhost:27017
+      APP_API_KEYS: dev-key
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[postgres]"
+      - run: |
+          uvicorn app.main:app --port 8000 &
+          for i in $(seq 30); do curl -sf localhost:8000/health && break; sleep 1; done
+          python scripts/seed.py
+          curl -sf -H "X-API-Key: dev-key" "localhost:8000/events?symbol=JPM" | grep dividend
+
+  docker:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with: { context: ., push: false, tags: "data-api-service:${{ github.sha }}" }
